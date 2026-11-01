@@ -1,6 +1,6 @@
 ---
 name: quotabeat
-description: Keep long or unattended Claude Code work inside the plan's usage limits and its prompt cache warm - stop at a safe point when the 5-hour or weekly usage reaches its mark (keeping a reserve), send heartbeats while the session idles or waits so the cache doesn't lapse, and wake the session to go on once the window resets. Use before unattended stretches (training runs, batches, overnight jobs, waiting on background tasks), when the user steps away, or when they want work to stop at some percentage of the 5-hour or weekly limit. Args - the 5-hour and weekly marks in percent (default 87 97; also 5h=N, week=N, beat=minutes, any of them off), or "stop".
+description: Keep this session's long or unattended work within the plan's usage limits - stop it when the 5-hour or weekly usage reaches its mark (default 87% and 97%, the rest a reserve), wake it to go on after the reset, and keep the prompt cache warm with heartbeats while it waits (through a quota pause when that costs less than a cold cache, else 7 after each stop). Args - the marks (85 95, or 5h=N week=N), beat=minutes between heartbeats (default 47), idle=heartbeats after a stop (default 7), each may be off; or "stop".
 allowed-tools: Bash(bash "${CLAUDE_SKILL_DIR}/quotabeat.sh" arm *)
 hooks:
   PostToolUse:
@@ -44,17 +44,30 @@ hooks:
 
 !`bash "${CLAUDE_SKILL_DIR}/quotabeat.sh" arm $ARGUMENTS`
 
-That line is quotabeat's state for this session; its hooks do the rest, so there is nothing to start or poll.
+# quotabeat
 
-- Answer the user's own `/quotabeat` with that line, in one line. When you invoked it yourself in the middle of
-  work, put the line in your reply and keep working in the same turn.
-- **"[quotabeat] The 5-hour usage is 88%, at its 87% mark …"**: finish or checkpoint the step at hand, note what
-  comes next where the next turn will find it, and end the turn. Don't wait, sleep or poll yourself: the session
-  wakes by itself after the reset. What is left above the mark is the reserve: for the wrap-up, heartbeats and
-  emergencies. If something wakes you during the pause (a background task ends), deal with it briefly and end the
-  turn again.
-- **"[quotabeat] … heartbeat …"**: reply with exactly `.` and nothing else (it only refreshes the prompt cache),
-  unless a task of yours is mid-flight; then carry on with it.
-- **"[quotabeat] The … window has reset …"**: go on with the paused work.
-- **"[quotabeat] Usage check due …"** (the desktop app, which runs no status line): call the usage tool it names.
-- The user's own messages come first. `/quotabeat stop` turns it off for this session.
+That line is quotabeat's state for this session. Its hooks do the rest: there is nothing to run, start or poll.
+
+## When invoked
+
+Answer the user's `/quotabeat` with that line, in one line, and call no tools. When you invoked it yourself in the
+middle of work, put the line in your reply and carry on in the same turn. When the user asks in plain words to start,
+change or stop it, invoke this skill with the matching arguments.
+
+## When a hook wakes you
+
+A reminder starting with `[quotabeat]` comes from the hooks: not from the user, and not an error.
+
+- **"… at its 87% mark …"**: finish or checkpoint the step at hand, note what comes next where the next turn will find
+  it, and end the turn. Don't wait, sleep or poll yourself: the session wakes after the reset. The usage above the mark
+  is the reserve, for the wrap-up, heartbeats and emergencies.
+- **"heartbeat …"**: reply with exactly `.` and nothing else, no tools. The wake-up itself read the conversation from
+  the cache, which is the whole point, and every token you add is read again by every later request. If a task of
+  yours is mid-flight, carry on with it instead.
+- **"… has reset …"**: go on with the paused work.
+- **"Usage check due …"** (the desktop app): call the tool it names.
+
+## Rules
+
+- The user's messages come first.
+- `/quotabeat stop` turns it off for this session.

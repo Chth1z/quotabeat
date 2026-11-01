@@ -1,38 +1,51 @@
 #!/usr/bin/env bash
-# quotabeat: keeps unattended Claude Code work inside the plan's usage limits, and its prompt cache warm, without
-# asking any server. One script, by role:
+# quotabeat: stops long or unattended Claude Code work at a mark below the plan's 5-hour and weekly usage limits,
+# wakes it to go on once the window resets, and keeps its prompt cache warm while it waits. Offline: the usage comes
+# from Claude Code itself. One script, by role:
 #
-#   statusline  the statusLine command. Every response tells Claude Code the account's 5-hour and weekly usage
-#               (rate_limits); this keeps it in <config>/quotabeat/usage-<account> and prints the status line.
-#   arm [args]  runs when /quotabeat is invoked (the !`...` line of SKILL.md): this session's marks and heartbeat.
+#   statusline  the statusLine command: every response hands Claude Code the account's usage (rate_limits); this keeps
+#               it in <config>/quotabeat/usage-<account> and prints the status line
+#   usage       PostToolUse of the desktop app's get_usage tool (the desktop app runs no status line): records the usage
+#               it reports and, when quotabeat asked for the call, hands Claude one line in place of the report
+#   arm [args]  the !`...` line of SKILL.md, run when /quotabeat is invoked: this session's marks and heartbeats
 #   hook        the skill's hooks, by event:
-#                 PostToolUse (async)  once a window reaches its mark, tells Claude to wrap up and end the turn;
-#                                      in the desktop app, which runs no status line, asks for a usage check
-#                 Stop (async)         at a mark: waits for the reset, then wakes the session to go on; idle:
-#                                      heartbeats that keep the prompt cache warm, at most 19 in a row (by then
-#                                      they have cost about one cold re-read, and a cold re-read is cheaper)
-#                 UserPromptSubmit     marks the session active; SessionEnd forgets it
-#   usage       PostToolUse of the desktop app's get_usage tool: records what it returned and hands Claude one
-#               line in place of the whole report.
+#                 PostToolUse       at a mark, tells Claude to wrap up and end the turn; in the desktop app, asks for
+#                                   a usage check when one is due
+#                 Stop              the timer: after a turn told to stop at a mark, waits for the reset and wakes the
+#                                   session to go on, with heartbeats through the pause where they cost less than a
+#                                   cold cache; after any other turn, IDLE heartbeats, one every BEAT minutes
+#                 UserPromptSubmit  the user wrote: a waiting timer gives way
+#                 SessionEnd        forgets the session
 #
-# Bash and coreutils only (Git Bash on Windows). QUOTABEAT_UNIT is the seconds in a minute (tests shorten it); a
-# file <config>/quotabeat/debug makes the hooks append their input to debug.log there.
+# PostToolUse and Stop run in the background (asyncRewake): exit 2 wakes Claude with what the hook wrote to stderr. A
+# heartbeat is such a wake-up with nothing to do: its request reads the conversation from the prompt cache at a tenth
+# of the price of fresh input, which renews the cache's hour; Claude answers "." and that turn's Stop starts the next
+# timer. The newest timer wins; older ones give way when they wake. A heartbeat goes out only while the cache is surely
+# still warm: after the machine slept past that, one would only pay to write the cache again.
+#
+# Bash 3.2+ and coreutils (Git Bash on Windows). QUOTABEAT_UNIT is the seconds in a minute (the tests shorten it); a
+# file <config>/quotabeat/debug makes the hooks log what they do to debug.log beside it.
 
 LC_ALL=C
-shopt -u patsub_replacement 2> /dev/null  # (bash 5.2+: else & and \ in a ${x/a/b} replacement change meaning)
+shopt -u patsub_replacement 2> /dev/null  # (bash 5.2+: else & in a ${x/a/b} replacement stands for the match)
 U=${QUOTABEAT_UNIT:-60}
 CFG=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 CFG=${CFG//\\//}
 DIR=$CFG/quotabeat
-MAXBEATS=19
+TTL=$(( 60 * U ))  # the prompt cache lives an hour after its last read
+WARM=$(( TTL - 7 * U ))  # surely warm this long after a turn ends: the read came when its last response began, and a
+                         # wake-up's request may be slow (a network coming back after sleep)
+# Prices in tenths of fresh input, with the 1-hour cache: a heartbeat reads the cached conversation (1); a session that
+# comes back to a cold cache writes it all again (20) where a warm one reads it (1).
+CACHE_READ=1 CACHE_WRITE=20
 USAGE_TOOL=mcp__ccd_session_mgmt__get_usage
 
-now() { printf -v NOW '%(%s)T' -1 2>/dev/null || NOW=$(date +%s); }
+now() { printf -v NOW '%(%s)T' -1 2> /dev/null || NOW=$(date +%s); }
 
 clock() {  # CLOCK: the epoch $1 as people read it, 04:00 within half a day, Mon 09:00 further off
   local f='%H:%M'
   (( $1 - NOW >= 43200 )) && f='%a %H:%M'
-  printf -v CLOCK "%($f)T" "$1" 2>/dev/null || CLOCK=$(date -d "@$1" +"$f" 2>/dev/null || date -r "$1" +"$f")
+  printf -v CLOCK "%($f)T" "$1" 2> /dev/null || CLOCK=$(date -d "@$1" +"$f" 2> /dev/null || date -r "$1" +"$f")
 }
 
 account() {  # ACCT: the desktop app and the SDK name it in the environment; a terminal's login is in .claude.json
@@ -45,6 +58,13 @@ account() {  # ACCT: the desktop app and the SDK name it in the environment; a t
       ACCT=${BASH_REMATCH[1]}
   fi
   ACCT=${ACCT:-default}
+}
+
+log() {
+  [[ -f $DIR/debug ]] || return 0
+  local t
+  printf -v t '%(%F %T)T' -1 2> /dev/null || t=$(date '+%F %T')
+  printf '%s %s %s %s\n' "$t" "$SID" "$$" "$*" >> "$DIR/debug.log"
 }
 
 # --- readings: one line per account, "<when> <window>:<percent>:<reset> ...", e.g. 1793464078 five_hour:6:1793476800
@@ -109,17 +129,27 @@ describe() {  # DESC: "5h 6% (04:00), 7d 94% (Mon 09:00)", from WIN, the 5-hour 
   done
 }
 
-# --- a session's state, one line: on m5 m7 beat beats gen acct desk noticed asked wake armed
+# --- a session's state, one line: m5 m7 beat idle active since gen wake acct desk armed asked noticed. No file: not
+# armed.
+#   m5 m7 beat idle  the marks (percent, 0 off), minutes between heartbeats (0 off), heartbeats after a stop
+#   active since     1 once a real turn ran (a prompt, a tool call, arming, a wake-up) since the last Stop, -1 from a
+#                    heartbeat until its own wake-up arrives (the desktop app hands that over as a prompt, which then
+#                    is no real turn); when the last real turn ended: heartbeat k after it is due at since + k * beat,
+#                    while k <= idle
+#   gen wake         the waiting timer's process (0 none); when a paused session wakes (0 not paused)
+#   acct desk        the account whose readings count; 1 in the desktop app, which runs no status line
+#   armed asked      when it was armed; when it last asked for a usage check (desktop app)
+#   noticed          the notices given, ",five_hour@<reset>:<level>,..."; ",blind" once told there is no reading
 
 load_state() {
   S=$DIR/$SID
-  [[ -r $S ]] && read -r ON M5 M7 BEAT BEATS GEN ACCT DESK NOTICED ASKED WAKE ARMED < "$S"
+  [[ -r $S ]] && read -r M5 M7 BEAT IDLE ACTIVE SINCE GEN WAKE ACCT DESK ARMED ASKED NOTICED < "$S"
 }
 
 save_state() {
   [[ -d $DIR ]] || mkdir -p "$DIR"
-  printf '%s %s %s %s %s %s %s %s %s %s %s %s\n' "$ON" "$M5" "$M7" "$BEAT" "$BEATS" "$GEN" "$ACCT" "$DESK" \
-    "$NOTICED" "$ASKED" "$WAKE" "$ARMED" > "$S.$$" && mv -f "$S.$$" "$S"
+  printf '%s %s %s %s %s %s %s %s %s %s %s %s %s\n' "$M5" "$M7" "$BEAT" "$IDLE" "$ACTIVE" "$SINCE" "$GEN" "$WAKE" \
+    "$ACCT" "$DESK" "$ARMED" "$ASKED" "$NOTICED" > "$S.$$" && mv -f "$S.$$" "$S"
 }
 
 prune() {  # NOTICED forgets the windows that have reset
@@ -133,53 +163,47 @@ prune() {  # NOTICED forgets the windows that have reset
   NOTICED=$out
 }
 
-# --- arm: /quotabeat [5h mark] [weekly mark] [5h=N] [week=N] [beat=minutes] [off] [stop]
+# --- arm: /quotabeat [5-hour mark] [weekly mark] [5h=N] [week=N] [beat=minutes] [idle=count], N or off; or stop
 
 arm() {
   SID=${CLAUDE_CODE_SESSION_ID:-}
   if [[ -z $SID ]]; then
-    echo "quotabeat: this environment gives no session id (CLAUDE_CODE_SESSION_ID), so nothing was armed."
+    echo "quotabeat: no session id here (CLAUDE_CODE_SESSION_ID), so nothing was armed."
     return 0
   fi
   S=$DIR/$SID
-  now
-  account
-  ON=1 M5=87 M7=97 BEAT=50 BEATS=0 GEN=0 DESK=0 NOTICED=- ASKED=0 WAKE=0 ARMED=$NOW
-  [[ ${CLAUDE_CODE_ENTRYPOINT:-} == claude-desktop ]] && DESK=1
-  local t label= pos=0 v
+  M5=87 M7=97 BEAT=47 IDLE=7
+  local t k v pos=0 off=0 bad=
   shopt -s nocasematch
   for t in "$@"; do
-    case $t in *=*|*:*) label=${t%%[=:]*} t=${t#*[=:]} ;; esac
-    case $label in 5h|hour|five_hour) label=5h ;; week|weekly|w|7d|seven_day) label=week ;; beat|heartbeat) label=beat ;; esac
-    case $t in
-      5h|hour|five_hour) label=5h; continue ;;
-      week|weekly|w|7d|seven_day) label=week; continue ;;
-      beat|heartbeat) label=beat; continue ;;
-      stop|disarm) ON=0; continue ;;
-      off) [[ -z $label ]] && { ON=0; continue; }; v=0 ;;
-      ''|*[!0-9.%]*) label=; continue ;;
-      *) v=${t%%[.%]*} v=$(( 10#${v:-0} )) ;;
-    esac
-    if [[ -z $label ]]; then
-      (( pos++ == 0 )) && label=5h || label=week
+    case $t in stop|off) off=1; continue ;; esac
+    k= v=${t%\%}
+    [[ $v == *=* ]] && k=${v%%=*} v=${v#*=}
+    [[ $v == off ]] && v=0
+    if [[ -z $v || $v == *[!0-9]* || ${#v} -gt 3 ]]; then bad+=" $t"; continue; fi
+    if [[ -z $k ]]; then
+      case $(( pos++ )) in 0) k=5h ;; 1) k=week ;; esac
     fi
-    case $label in 5h) M5=$v ;; week) M7=$v ;; beat) BEAT=$v ;; esac
-    label=
+    case $k in
+      5h) M5=$(( 10#$v )) ;;
+      week) M7=$(( 10#$v )) ;;
+      beat) BEAT=$(( 10#$v )) ;;
+      idle) IDLE=$(( 10#$v )) ;;
+      *) bad+=" $t" ;;
+    esac
   done
   shopt -u nocasematch
-  if [[ $ON != 1 ]]; then
-    load_state
-    ON=0 GEN=0 WAKE=0
-    save_state
+  if (( off )); then
+    rm -f "$S"
     echo "quotabeat is off for this session: no stop at a mark, no heartbeat."
     return 0
   fi
   (( M5 > 100 )) && M5=100
   (( M7 > 100 )) && M7=100
-  (( BEAT > 0 && BEAT < 5 )) && BEAT=5
-  (( BEAT > 55 )) && BEAT=55   # past 55 minutes the 1-hour cache can lapse before a heartbeat lands
+  (( BEAT && BEAT < 5 )) && BEAT=5
+  (( BEAT * U > WARM )) && BEAT=$(( WARM / U ))  # (53) no heartbeat goes out later than that after the last read
   local note= f g
-  # A session whose prompt cache lives 5 minutes gains nothing from a heartbeat every 50.
+  # A session whose prompt cache lives 5 minutes gains nothing from a heartbeat every 47.
   for f in "$CFG"/projects/*/"$SID".jsonl; do
     [[ -r $f ]] || continue
     g=$(tail -c 400000 "$f" | grep -o '"cache_creation":{[^}]*}' | tail -n 1)
@@ -187,15 +211,20 @@ arm() {
       BEAT=0 note=" Heartbeat off: this session's prompt cache lasts 5 minutes, a heartbeat can't keep it."
     fi
   done
+  now
+  account
+  ACTIVE=1 SINCE=0 GEN=0 WAKE=0 DESK=0 ARMED=$NOW ASKED=0 NOTICED=-
+  [[ ${CLAUDE_CODE_ENTRYPOINT:-} == claude-desktop ]] && DESK=1
   load_usage
   (( DESK && ! TAKEN )) && ASKED=$NOW  # the line below asks for a check: its report gets shortened too
   save_state
-  local marks="${M5}% of the 5-hour window, ${M7}% of the weekly"
-  (( M5 == 0 )) && marks="${M7}% of the weekly window (5-hour off)"
-  (( M7 == 0 )) && marks="${M5}% of the 5-hour window (weekly off)"
-  (( M5 == 0 && M7 == 0 )) && marks="no mark"
-  local beat="heartbeat after $BEAT idle minutes"
-  (( BEAT == 0 )) && beat="no heartbeat"
+  local stop="stop at ${M5}% of the 5-hour window and ${M7}% of the weekly"
+  (( M5 == 0 )) && stop="stop at ${M7}% of the weekly window (5-hour off)"
+  (( M7 == 0 )) && stop="stop at ${M5}% of the 5-hour window (weekly off)"
+  (( M5 == 0 && M7 == 0 )) && stop="no stop at a mark"
+  local beat="a heartbeat every $BEAT minutes while the session waits: $IDLE after a stop, all the way through a quota pause when that costs less than a cold cache"
+  (( IDLE == 0 )) && beat="a heartbeat every $BEAT minutes through a quota pause when that costs less than a cold cache, none after other stops"
+  (( BEAT == 0 )) && beat="no heartbeats"
   local usage
   if (( TAKEN )); then
     describe
@@ -205,18 +234,21 @@ arm() {
   else
     usage="No usage reading for this account yet: it comes with the next response if the statusLine is quotabeat's (see its README); until then nothing stops this session."
   fi
-  echo "quotabeat on: stop at $marks; $beat. $usage$note"
+  echo "quotabeat on: $stop; $beat. $usage$note${bad:+ Ignored:$bad.}"
 }
 
 # --- hooks
 
-post() {  # PostToolUse, in the background: the mark notice, and in the desktop app the call for a usage check
-  load_state && [[ $ON == 1 ]] || return 0
-  : > "$S.act"
-  [[ $IN == *"\"tool_name\":\"$USAGE_TOOL\""* ]] && return 0  # its own hook reads it
+post() {  # PostToolUse, in the background: the notice at a mark, and in the desktop app the call for a usage check
+  load_state || return 0
+  local msg= changed=0
+  (( ACTIVE > 0 )) || ACTIVE=1 changed=1  # a tool ran: a real turn
+  if [[ $IN == *"\"tool_name\":\"$USAGE_TOOL\""* ]]; then  # its own hook reads it
+    (( changed )) && save_state
+    return 0
+  fi
   now
   load_usage
-  local msg= changed=0
   if (( DESK )); then
     local due=$(( 5 * U )) w p m head=100
     if (( TAKEN )); then  # half a minute per point left before the nearest mark, from 5 minutes to an hour
@@ -246,83 +278,109 @@ post() {  # PostToolUse, in the background: the mark notice, and in the desktop 
     [[ ,$NOTICED, == *",$key,"* ]] && continue
     NOTICED+=,$key changed=1
     name "$n"
-    clock "$r"
     (( r > until )) && until=$r
     if (( l == 1 )); then
-      msg+="${msg:+ }The $NAME usage is $p%, at its $m% mark (it resets at $CLOCK)."
+      msg+="${msg:+ }The $NAME usage is $p%, at its $m% mark."
     else
       msg+="${msg:+ }The $NAME usage is $p%, well past its $m% mark: end the turn now."
     fi
   done
   if (( until )); then
     clock $(( until + U ))
-    msg+=" Finish or checkpoint the step at hand, note what comes next, and end the turn; don't wait or sleep yourself: the session wakes by itself at $CLOCK."
+    msg+=" Finish or checkpoint the step at hand, note what comes next, and end the turn without waiting yourself: the session wakes by itself at $CLOCK, after the reset."
   fi
   (( changed )) && { prune; save_state; }
   [[ -n $msg ]] || return 0
-  printf '%s\n' "$msg" >&2
+  log "notice: $msg"
+  printf '%s\n' "$msg" >&3
   return 2
 }
 
-stop() {  # Stop, in the background: wait at a mark for the reset, or keep the cache warm while idle
+stop() {  # Stop, in the background: the timer
   [[ -r $DIR/$SID ]] || return 0
-  sleep 2  # the turn's last reading lands a moment after Stop (the status line's 300 ms debounce), and the
-           # last tool's PostToolUse is done by then
-  load_state && [[ $ON == 1 ]] || return 0
-  if [[ $IN == *'"last_assistant_message":"."'* ]]; then BEATS=$(( BEATS + 1 )); else BEATS=0; fi
   now
+  local t=$NOW h n r told=0 wake=0 next=0 need k names=  # t: the turn's last request read the cache just before
+  sleep 2  # the turn's last reading lands a moment after Stop (the status line runs 300 ms after a response)
+  load_state || return 0
+  now
+  (( ACTIVE > 0 )) && SINCE=$t  # a real turn ended: the heartbeats after a stop count from here
+  ACTIVE=0
   load_usage
   over
-  local h r wake=0 next=0 names=
+  prune
   for h in "${HITS[@]}"; do
-    r=${h#*:*:*:} r=${r%%:*}
+    n=${h%%:*} r=${h#*:*:*:} r=${r%%:*}
+    [[ ,$NOTICED, == *",$n@"* ]] && told=1
     (( r > wake )) && wake=$r
-    name "${h%%:*}"
-    [[ $names == *"$NAME"* ]] || names+="${names:+ and }$NAME"
+    name "$n"
+    names+="${names:+ and }$NAME"
   done
-  if (( wake )); then
-    wake=$(( wake + U ))  # a minute after the reset
-    next=$wake
-    # Heartbeats through the pause only when it is short enough that they cost less than one cold re-read.
-    (( BEAT > 0 && wake - NOW <= MAXBEATS * BEAT * U && NOW + BEAT * U < wake )) && next=$(( NOW + BEAT * U ))
-  elif (( BEAT > 0 && BEATS < MAXBEATS )); then
-    next=$(( NOW + BEAT * U ))
+  if (( told )); then
+    # Told to stop at a mark: wake a minute after the reset (the later one, with two windows at their marks). Bridging
+    # the pause takes a heartbeat before each stretch without a cache read outgrows WARM; worth it only if they cost
+    # less than writing the cache again when the session wakes cold. Then all of them, else none.
+    wake=$(( wake + U )) next=$wake
+    if (( BEAT )); then
+      need=$(( (wake - t - WARM + BEAT * U - 1) / (BEAT * U) ))  # rounded up; 0 or less: the cache outlasts the pause
+      (( need > 0 && need * CACHE_READ < CACHE_WRITE - CACHE_READ )) && next=$(( t + BEAT * U ))
+    fi
+  else
+    wake=0
+    if (( BEAT )); then  # heartbeat k after the last real stop is due at SINCE + k * BEAT: the time gone is the count
+      k=$(( (t - SINCE) / (BEAT * U) + 1 ))
+      (( k <= IDLE )) && next=$(( SINCE + k * BEAT * U ))
+    fi
   fi
   WAKE=$wake GEN=0
   (( next )) && GEN=$$
   save_state
+  log "stop: since $SINCE, wake $wake, next $next"
   (( next )) || return 0
-  : > "$S.w"
-  while now; (( NOW < next )); do sleep $(( next - NOW )); done
-  load_state || return 0                       # the session ended
-  [[ $ON == 1 && $GEN == "$$" ]] || return 0   # turned off, or a newer turn's Stop took over
-  [[ $S.act -nt $S.w ]] && return 0            # the session went on: a tool ran, or the user wrote
-  if (( next == wake )); then
-    WAKE=0
-    prune
-    save_state
-    printf 'The %s window has reset. Go on with the work where it stopped.\n' "$names" >&2
-  elif (( wake )); then
-    clock "$wake"
-    printf 'Heartbeat to keep the prompt cache warm through the quota pause (it ends at %s). Reply with exactly . and nothing else.\n' "$CLOCK" >&2
-  else
-    printf 'Idle heartbeat to keep the prompt cache warm. Reply with exactly . and nothing else.\n' >&2
-  fi
-  return 2
+  while :; do
+    # A minute at most per sleep, then a look at the clock: a sleep may not count the time the machine is asleep.
+    while now; (( NOW < next )); do sleep $(( next - NOW < U ? next - NOW : U )); done
+    load_state || { log "disarmed"; return 0; }
+    [[ $GEN == "$$" ]] || { log "gave way"; return 0; }  # a newer turn's timer, or the user wrote
+    if (( next == wake )); then
+      ACTIVE=1 WAKE=0
+      prune
+      save_state
+      log "wake-up"
+      printf 'The %s window has reset: go on with the paused work.\n' "$names" >&3
+      return 2
+    fi
+    if (( NOW - t <= WARM )); then
+      ACTIVE=-1
+      save_state
+      log "heartbeat"
+      echo 'heartbeat: reply with exactly . and nothing else.' >&3
+      return 2
+    fi
+    # The machine slept past the time the cache is surely warm: a heartbeat now might only pay to write it again.
+    log "cache may be cold"
+    (( wake )) || return 0
+    next=$wake
+  done
 }
 
 hook() {
+  exec 3>&2 2> /dev/null  # on exit 2 Claude reads stderr: only the note goes there (fd 3), never a stray error
   IFS= read -r -d '' -n 16384 IN  # the fields used come first; a tool's output can run long
   (( ${#IN} >= 16384 )) && cat > /dev/null
   [[ $IN =~ \"session_id\":\"([^\"]+)\" ]] || return 0
   SID=${BASH_REMATCH[1]}
-  [[ -f $DIR/debug ]] && printf '%s\n' "$IN" >> "$DIR/debug.log"
   [[ $IN =~ \"hook_event_name\":\"([A-Za-z]+)\" ]] || return 0
-  case ${BASH_REMATCH[1]} in
+  local event=${BASH_REMATCH[1]}
+  [[ $event == PostToolUse ]] || log "$event"
+  case $event in
     PostToolUse) post ;;
     Stop) stop ;;
-    UserPromptSubmit) [[ -f $DIR/$SID ]] && : > "$DIR/$SID.act" ;;
-    SessionEnd) rm -f "$DIR/$SID" "$DIR/$SID.act" "$DIR/$SID.w" ;;
+    UserPromptSubmit)  # in the desktop app a heartbeat's own wake-up comes this way too: that one is no real turn
+      if load_state; then
+        if (( ACTIVE < 0 )); then ACTIVE=0; else ACTIVE=1 GEN=0; fi
+        save_state
+      fi ;;
+    SessionEnd) rm -f "$DIR/$SID" ;;
   esac
 }
 
@@ -343,7 +401,6 @@ usage() {
   IN=$(cat)
   [[ $IN =~ \"session_id\":\"([^\"]+)\" ]] || return 0
   SID=${BASH_REMATCH[1]}
-  [[ -f $DIR/debug ]] && printf '%s\n' "$IN" >> "$DIR/debug.log"
   now
   account
   # The report is JSON inside the tool's text, so its quotes may come escaped: \"label\": \"5-hour limit\", ...
@@ -367,6 +424,7 @@ usage() {
   done
   (( ${#NEW[@]} )) || return 0
   record
+  log "usage: ${NEW[*]}"
   load_state || return 0
   # Shorten the report only when quotabeat asked for it: a call of Claude's own wants the whole of it.
   (( ASKED && NOW - ASKED < 15 * U )) || return 0
@@ -401,7 +459,7 @@ statusline() {
     line+="${line:+ | }ctx ${BASH_REMATCH[2]%.*}%"
   if [[ $IN =~ \"session_id\":\"([^\"]+)\" ]]; then
     SID=${BASH_REMATCH[1]}
-    if load_state && [[ $ON == 1 ]]; then
+    if load_state; then
       if (( WAKE > NOW )); then
         clock "$WAKE"
         line+=" | paused to $CLOCK"

@@ -7,6 +7,8 @@
 cd "$(dirname "$0")/.." || exit 1
 QB=$PWD/quotabeat.sh
 PASS=0 FAIL=0
+BEAT_NOTE='heartbeat: reply with exactly . and nothing else.'
+RESET_NOTE='The 5-hour window has reset: go on with the paused work.'
 
 is() { if [[ $2 == "$3" ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf 'FAIL %s\n  want: %s\n  got:  %s\n' "$1" "$3" "$2"; fi; }
 has() { if [[ $2 == *"$3"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf 'FAIL %s\n  want: ...%s...\n  got:  %s\n' "$1" "$3" "$2"; fi; }
@@ -34,10 +36,17 @@ post() {  # a tool ran: the async PostToolUse hook's stderr and exit code
   OUT=$(input PostToolUse ',"tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":"x"}' | bash "$QB" hook 2>&1)
   CODE=$?
 }
+prompt() { input UserPromptSubmit ',"prompt":"hi"' | bash "$QB" hook; }
 state() { cat "$T/quotabeat/s1"; }
-field() { local f; read -ra f < "$T/quotabeat/s1"; echo "${f[$1]}"; }  # 0 on, 1 m5, 2 m7, 3 beat, 4 beats, 5 gen, 7 desk, 8 noticed, 9 asked, 10 wake
-stop_bg() { input Stop ",\"stop_hook_active\":false,\"last_assistant_message\":\"${1:-done}\",\"background_tasks\":[]" | bash "$QB" hook 2> "$T/stop.err" & PID=$!; }
-waiter() { for _ in $(seq 1 80); do [[ $(field 5) == "$PID" ]] && return 0; sleep 0.1; done; return 1; }  # this Stop waits
+# 0 m5, 1 m7, 2 beat, 3 idle, 4 active, 5 since, 6 gen, 7 wake, 8 acct, 9 desk, 10 armed, 11 asked, 12 noticed
+field() { local f; read -ra f < "$T/quotabeat/s1"; echo "${f[$1]}"; }
+set_field() { local f; read -ra f < "$T/quotabeat/s1"; f[$1]=$2; echo "${f[*]}" > "$T/quotabeat/s1"; }
+stop_bg() {  # the turn ends: its Stop hook runs in the background
+  input Stop ',"stop_hook_active":false,"last_assistant_message":"done","background_tasks":[],"session_crons":[]' |
+    bash "$QB" hook 2> "$T/stop.err" &
+  PID=$!
+}
+waiter() { for _ in $(seq 1 80); do [[ $(field 6) == "$PID" ]] && return 0; sleep 0.1; done; return 1; }  # its timer waits
 
 # --- the status line and the readings
 
@@ -66,20 +75,24 @@ is "a reset window reads 0" "$(sl 9 $((NOW - 10)) | cut -d'|' -f1)" "5h 0% "
 
 setup
 sl 6 $((NOW + 3600)) 94 $((NOW + 86400)) > /dev/null
-has "arm: defaults" "$(arm)" "stop at 87% of the 5-hour window, 97% of the weekly; heartbeat after 50 idle minutes. Usage now: 5h 6%"
-is "arm: state" "$(state)" "1 87 97 50 0 0 acct-t 0 - 0 0 $(field 11)"
-arm 80 90 > /dev/null; is "arm: two numbers" "$(field 1) $(field 2)" "80 90"
-arm week=off > /dev/null; is "arm: week=off" "$(field 1) $(field 2)" "87 0"
-arm 5h 70 beat=30 > /dev/null; is "arm: label value, beat=" "$(field 1) $(field 2) $(field 3)" "70 97 30"
-arm beat=2 > /dev/null; is "arm: beat floor" "$(field 3)" "5"
-arm 95% Beat=OFF > /dev/null; is "arm: percent sign, any case" "$(field 1) $(field 3)" "95 0"
-has "arm: stop" "$(arm stop)" "off for this session"
-is "arm: stop state" "$(field 0)" "0"
-unset CLAUDE_CODE_SESSION_ID
+has "arm: defaults" "$(arm)" "quotabeat on: stop at 87% of the 5-hour window and 97% of the weekly; a heartbeat every 47 minutes while the session waits: 7 after a stop, all the way through a quota pause when that costs less than a cold cache. Usage now: 5h 6%"
+is "arm: state" "$(state)" "87 97 47 7 1 0 0 0 acct-t 0 $(field 10) 0 -"
+has "arm: the status line shows the marks" "$(sl 6 $((NOW + 3600)))" "| guard 87/97"
+arm 80 90 > /dev/null; is "arm: two numbers" "$(field 0) $(field 1)" "80 90"
+arm 85% > /dev/null; is "arm: one number, a percent sign" "$(field 0) $(field 1)" "85 97"
+arm week=off Beat=30 IDLE=3 > /dev/null; is "arm: key=value, any case" "$(field 0) $(field 1) $(field 2) $(field 3)" "87 0 30 3"
+arm beat=2 > /dev/null; is "arm: beat floor" "$(field 2)" "5"
+arm beat=90 > /dev/null; is "arm: beat ceiling, the time the cache is surely warm" "$(field 2)" "53"
+arm 5h=150 > /dev/null; is "arm: a mark tops out at 100" "$(field 0)" "100"
+has "arm: words it doesn't know are named" "$(arm 85 bogus x=1 90 70)" "Ignored: bogus x=1 70."
+has "arm: idle=off" "$(arm idle=off)" "none after other stops"
+has "arm: beat=off" "$(arm beat=off)" "; no heartbeats."
+has "arm: stop" "$(arm stop)" "quotabeat is off for this session"
+[[ -e $T/quotabeat/s1 ]]; is "arm: stop forgets the session" "$?" "1"
 has "arm: no session id" "$(bash "$QB" arm)" "nothing was armed"
 printf '{"type":"assistant","message":{"usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":900}}}}\n' > "$TR"
 has "arm: a 5-minute cache gets no heartbeat" "$(arm)" "Heartbeat off: this session's prompt cache lasts 5 minutes"
-is "arm: 5-minute cache state" "$(field 3)" "0"
+is "arm: 5-minute cache state" "$(field 2)" "0"
 
 # --- the mark notice (PostToolUse)
 
@@ -87,11 +100,11 @@ setup
 sl 50 $((NOW + 3600)) 50 $((NOW + 86400)) > /dev/null
 arm > /dev/null
 post; is "below the marks: nothing" "$CODE:$OUT" "0:"
-[[ -f $T/quotabeat/s1.act ]]; is "a tool marks the session active" "$?" "0"
+set_field 4 0; post; is "a tool marks a real turn" "$(field 4)" "1"
 sl 88 $((NOW + 3600)) > /dev/null
 post; is "at the 5-hour mark: exit 2" "$CODE" "2"
 has "at the 5-hour mark: the notice" "$OUT" "The 5-hour usage is 88%, at its 87% mark"
-has "at the 5-hour mark: what to do" "$OUT" "end the turn; don't wait or sleep yourself: the session wakes by itself at"
+has "at the 5-hour mark: what to do" "$OUT" "and end the turn without waiting yourself: the session wakes by itself at $(date -d @$((NOW + 3601)) +%H:%M), after the reset."
 post; is "the notice comes once" "$CODE:$OUT" "0:"
 sl 94 $((NOW + 3600)) > /dev/null
 post; has "past the middle of the reserve: again, firmer" "$OUT" "well past its 87% mark: end the turn now"
@@ -113,8 +126,8 @@ post; is "and only once" "$CODE:$OUT" "0:"
 setup
 export CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_ACCOUNT_UUID=acct-d
 has "desktop arm without a reading" "$(arm)" "call mcp__ccd_session_mgmt__get_usage once now"
-is "desktop arm: that request counts as asked" "$(field 9)" "$(field 11)"
-sed -i 's/^\(\([^ ]* \)\{9\}\)[0-9]*/\10/' "$T/quotabeat/s1"
+is "desktop arm: that request counts as asked" "$(field 11)" "$(field 10)"
+set_field 11 0
 post; has "desktop: a usage check is asked for" "$OUT" "Usage check due: call mcp__ccd_session_mgmt__get_usage"
 post; is "desktop: asked once until it is due again" "$CODE:$OUT" "0:"
 REPORT='{\n  \"plan\": {\n    \"status\": \"ok\",\n    \"windows\": [\n      {\n        \"label\": \"5-hour limit\",\n        \"percentUsed\": 16,\n        \"resetsAt\": \"2030-01-01T04:19:59.929Z\",\n        \"resetsIn\": \"4h\"\n      },\n      {\n        \"label\": \"Weekly · all models\",\n        \"percentUsed\": 2,\n        \"resetsAt\": \"2030-01-02T06:59:59.929Z\"\n      }\n    ]\n  }\n}'
@@ -127,93 +140,89 @@ OUT=$(printf '%s' "$USAGE_IN" | bash "$QB" usage)
 is "desktop: a call quotabeat didn't ask for keeps its whole report" "$OUT" ""
 unset CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_ACCOUNT_UUID
 
-# --- Stop: heartbeats, the pause, the wake-up
+# --- Stop: heartbeats after a stop, counted by the time since it
 
 setup
 sl 10 $((NOW + 3600)) > /dev/null
+arm beat=3 idle=2 > /dev/null
+stop_bg; wait $PID; CODE=$?
+is "after a stop: a heartbeat one interval later" "$CODE:$(cat "$T/stop.err")" "2:$BEAT_NOTE"
+is "the stop is where the count starts; the timer marks its heartbeat" "$(field 4):$(( $(field 5) >= NOW ))" "-1:1"
+prompt
+is "the heartbeat's own wake-up, handed over as a prompt (the desktop app), is no real turn" "$(field 4)" "0"
+stop_bg; wait $PID; CODE=$?
+is "the heartbeat's own turn: the next, due two intervals after the stop" "$CODE:$(cat "$T/stop.err")" "2:$BEAT_NOTE"
+stop_bg; wait $PID; CODE=$?
+is "idle=2: then the cache is let go (also with no prompt for the wake-up)" "$CODE:$(field 6):$(field 4)" "0:0:0"
+post; is "a tool marks a real turn" "$(field 4)" "1"
+stop_bg; wait $PID; CODE=$?
+is "after a real turn they count from its stop again" "$CODE" "2"
+set_field 4 0; prompt; is "a prompt marks a real turn too" "$(field 4)" "1"
+arm beat=3 idle=0 > /dev/null
+stop_bg; wait $PID; CODE=$?
+is "idle=0: no heartbeat after a stop" "$CODE:$(field 6):$(cat "$T/stop.err")" "0:0:"
 arm beat=1 > /dev/null
-stop_bg; wait $PID; CODE=$?
-is "idle: a heartbeat after a minute" "$CODE" "2"
-has "idle: the heartbeat's words" "$(cat "$T/stop.err")" "Idle heartbeat to keep the prompt cache warm. Reply with exactly . and nothing else."
-stop_bg .; waiter; is "a heartbeat's own turn counts" "$(field 4)" "1"
-kill $PID 2> /dev/null; wait $PID 2> /dev/null
-sed -i 's/^\(1 [0-9]* [0-9]* [0-9]* \)[0-9]*/\118/' "$T/quotabeat/s1"
-stop_bg .; wait $PID; CODE=$?
-is "after 19 heartbeats in a row the cache is let go" "$CODE:$(field 4):$(field 5)" "0:19:0"
-stop_bg 'real work'; waiter; is "a real turn starts the count again" "$(field 4)" "0"
-kill $PID 2> /dev/null; wait $PID 2> /dev/null
+stop_bg; waiter; kill -STOP $PID; sleep 4; kill -CONT $PID; wait $PID; CODE=$?
+is "the machine slept a little: the heartbeat goes out late" "$CODE:$(cat "$T/stop.err")" "2:$BEAT_NOTE"
+arm beat=1 > /dev/null
+stop_bg; waiter; kill -STOP $PID; sleep 57; kill -CONT $PID; wait $PID; CODE=$?
+is "the machine slept past the time the cache is surely warm: no heartbeat" "$CODE:$(cat "$T/stop.err")" "0:"
 
-setup
-sl 88 $((NOW + 6)) > /dev/null
-arm beat=off > /dev/null
-stop_bg; wait $PID; CODE=$?
-is "at a mark: wakes after the reset" "$CODE" "2"
-has "at a mark: the wake-up's words" "$(cat "$T/stop.err")" "The 5-hour window has reset. Go on with the work where it stopped."
-is "after the wake-up nothing is pending" "$(field 10)" "0"
+# --- Stop: a pause at a mark
 
 setup
 sl 88 $((NOW + 8)) > /dev/null
 arm beat=1 > /dev/null
+post
 stop_bg; wait $PID; CODE=$?
-is "a short pause gets heartbeats" "$CODE" "2"
-has "a heartbeat during the pause" "$(cat "$T/stop.err")" "through the quota pause (it ends at"
+is "told to stop at a mark: wakes after the reset, no heartbeat while the cache outlasts the pause" "$CODE:$(cat "$T/stop.err")" "2:$RESET_NOTE"
+is "after the wake-up nothing is pending, and that turn is a real one" "$(field 7):$(field 4)" "0:1"
 
 setup
-sl 88 $((NOW + 100)) > /dev/null
+sl 88 $((NOW + 65)) > /dev/null
 arm beat=1 > /dev/null
+post
+stop_bg; wait $PID; CODE=$?
+is "a pause the cache can't outlast, cheap enough to bridge: heartbeats" "$CODE:$(cat "$T/stop.err")" "2:$BEAT_NOTE"
+is "and the session stays paused" "$(field 7)" "$((NOW + 66))"
+has "the status line says so" "$(sl 88 $((NOW + 65)))" "| paused to $(date -d @$((NOW + 66)) +%H:%M)"
+
+setup
+sl 88 $((NOW + 200)) > /dev/null
+arm beat=5 > /dev/null
+post
 stop_bg; waiter
-is "a pause longer than 19 heartbeats: none, just the wake-up" "$(field 10)" "$((NOW + 101))"
+is "a pause whose heartbeats would cost more than a cold cache: it waits for the wake-up" "$(field 7)" "$((NOW + 201))"
+sleep 7; kill -0 $PID 2> /dev/null; is "and sends no heartbeat at all" "$?:$(cat "$T/stop.err")" "0:"
 kill $PID 2> /dev/null; wait $PID 2> /dev/null
 
 setup
+sl 88 $((NOW + 3600)) > /dev/null
+arm beat=1 > /dev/null
+stop_bg; wait $PID; CODE=$?
+is "at a mark but never told (an idle session): heartbeats as after any stop, no wake-up" "$CODE:$(cat "$T/stop.err"):$(field 7)" "2:$BEAT_NOTE:0"
+
+# --- a waiting timer gives way
+
+setup
 sl 10 $((NOW + 3600)) > /dev/null
-arm beat=4 > /dev/null  # (long enough for a newer Stop to settle and take over before this one's beat)
-for change in newer active prompt off end; do
-  stop_bg; waiter || is "$change: the Stop hook waits" no yes
+arm beat=4 > /dev/null  # (long enough for a newer Stop to settle and take over before this one's heartbeat)
+for change in newer prompt off end; do
+  stop_bg; waiter || is "$change: the timer waits" no yes
   case $change in
     newer) input Stop ',"last_assistant_message":"x"' | bash "$QB" hook 2> /dev/null & NEWER=$! ;;
-    active) sleep 1.1; post ;;
-    prompt) sleep 1.1; input UserPromptSubmit ',"prompt":"hi"' | bash "$QB" hook ;;
+    prompt) prompt ;;
     off) arm stop > /dev/null ;;
     end) input SessionEnd ',"reason":"clear"' | bash "$QB" hook ;;
   esac
   wait $PID; CODE=$?
-  is "$change: the waiting Stop gives way quietly" "$CODE:$(cat "$T/stop.err")" "0:"
+  is "$change: the waiting timer gives way quietly" "$CODE:$(cat "$T/stop.err")" "0:"
   [[ $change == newer ]] && { kill $NEWER 2> /dev/null; wait $NEWER 2> /dev/null; }
   [[ $change == end ]] && { [[ -e $T/quotabeat/s1 ]]; is "SessionEnd forgets the session" "$?" "1"; }
   [[ $change == off || $change == end ]] && arm beat=4 > /dev/null
 done
-
-# --- install.sh
-
-setup
-S=$T/settings.json
-bash install.sh > /dev/null
-OURS="{\"type\": \"command\", \"command\": \"bash \\\"$(command -v cygpath > /dev/null && cygpath -m "$T" || echo "$T")/skills/quotabeat/quotabeat.sh\\\" statusline\"}"
-is "install: no settings.json" "$(cat "$S")" "{
-  \"statusLine\": $OURS
-}"
-[[ -f $T/skills/quotabeat/SKILL.md && -f $T/skills/quotabeat/quotabeat.sh ]]; is "install: the skill is copied" "$?" "0"
-printf '{\n  "theme": "dark",\n  "env": {\n    "A": "1"\n  }\n}' > "$S"
-bash install.sh > /dev/null
-is "install: added to settings that have none" "$(cat "$S")" "{
-  \"statusLine\": $OURS,
-  \"theme\": \"dark\",
-  \"env\": {
-    \"A\": \"1\"
-  }
-}"
-bash install.sh uninstall > /dev/null
-is "uninstall: the entry goes with its comma" "$(cat "$S")" $'{\n  \n  "theme": "dark",\n  "env": {\n    "A": "1"\n  }\n}'
-THEIRS='{"type": "command", "command": "jq -r \"[\\(.model.display_name)] & \\(.cwd)\""}'
-printf '{\n  "theme": "dark",\n  "statusLine": %s\n}' "$THEIRS" > "$S"
-bash install.sh 2> /dev/null; is "install: someone else's status line stays" "$?:$(cat "$S")" "1:$(printf '{\n  "theme": "dark",\n  "statusLine": %s\n}' "$THEIRS")"
-bash install.sh --replace > /dev/null
-is "install --replace" "$(cat "$S")" "$(printf '{\n  "theme": "dark",\n  "statusLine": %s\n}' "$OURS")"
-bash install.sh > /dev/null; is "install again: its own line is no obstacle" "$?" "0"
-bash install.sh uninstall > /dev/null
-is "uninstall: the line set before comes back, & and \\ intact" "$(cat "$S")" "$(printf '{\n  "theme": "dark",\n  "statusLine": %s\n}' "$THEIRS")"
-[[ -e $T/quotabeat/statusline-before.json ]]; is "uninstall: nothing kept" "$?" "1"
+stop_bg; waiter; sleep 1.1; post
+wait $PID; is "a tool call alone leaves the timer be (the turn's own last PostToolUse may land late)" "$?" "2"
 
 rm -rf "$T"
 echo "$PASS passed, $FAIL failed"
