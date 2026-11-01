@@ -7,7 +7,7 @@ hooks:
     - matcher: "*"
       hooks:
         - type: command
-          command: bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat/quotabeat.sh" hook
+          command: bash "${CLAUDE_PLUGIN_ROOT:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat}/quotabeat.sh" hook
           shell: bash
           asyncRewake: true
           timeout: 60
@@ -16,7 +16,7 @@ hooks:
   Stop:
     - hooks:
         - type: command
-          command: bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat/quotabeat.sh" hook
+          command: bash "${CLAUDE_PLUGIN_ROOT:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat}/quotabeat.sh" hook
           shell: bash
           asyncRewake: true
           timeout: 700000
@@ -25,13 +25,13 @@ hooks:
   UserPromptSubmit:
     - hooks:
         - type: command
-          command: bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat/quotabeat.sh" hook
+          command: bash "${CLAUDE_PLUGIN_ROOT:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat}/quotabeat.sh" hook
           shell: bash
           async: true
   SessionEnd:
     - hooks:
         - type: command
-          command: bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat/quotabeat.sh" hook
+          command: bash "${CLAUDE_PLUGIN_ROOT:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat}/quotabeat.sh" hook
           shell: bash
           timeout: 5
 ---

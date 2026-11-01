@@ -52,33 +52,43 @@ log() {
 
 # --- usage. Every API response carries the account's usage in its headers: anthropic-ratelimit-unified-5h-utilization
 # (0.35 is 35%) and -5h-reset (an epoch), the same for 7d. With ANTHROPIC_LOG=debug the SDK inside Claude Code prints
-# each response's headers, and DEBUG=1 keeps them: a terminal session in <config>/debug/<session>.txt, one line per
+# each response's headers, and DEBUG_SDK=1 keeps them: a terminal session in <config>/debug/<session>.txt, one line per
 # response; the desktop app's sessions, with DEBUG_CLAUDE_AGENT_SDK=1 as well, in <config>/debug/sdk-*.txt, a line per
 # header and not always in order. So each value is the last of its kind in the log's tail, and a desktop log counts
 # only with this session's organization. (claude -p prints the headers to stdout instead: no reading there.)
 
-read_usage() {  # WIN (window:percent:reset ...) from the newest response this session can see; TAKEN 1 if any
-  WIN=() TAKEN=0
-  local f files=("$LOGS/$SID.txt") org=${CLAUDE_CODE_ORGANIZATION_UUID:-} line k v o u5 r5 u7 r7
-  [[ -n $org ]] && while IFS= read -r f; do files+=("$f"); done < <(ls -t "$LOGS"/sdk-*.txt 2> /dev/null | head -n 3)
+read_usage() {  # WIN (window:percent:reset ...) from the newest response this session can see
+  WIN=()
+  local f files=("$LOGS/$SID.txt") org=${CLAUDE_CODE_ORGANIZATION_UUID:-} line k v o u5 r5 u7 r7 ro ru5 rr5 ru7 rr7
+  [[ -n $org ]] && while IFS= read -r f; do files+=("$f"); done < <(ls -t "$LOGS"/sdk-*.txt 2> /dev/null | head -n 5)
   for f in "${files[@]}"; do
     [[ -r $f ]] || continue
-    o= u5= r5= u7= r7=
+    o= u5= r5= u7= r7= ro= ru5= rr5= ru7= rr7=
     while IFS= read -r line; do
+      if [[ $line == "response start {" ]]; then
+        if [[ $f != */sdk-* || $ro == "$org" ]]; then
+          [[ -n $ro ]] && o=$ro
+          [[ -n $ru5 ]] && u5=$ru5; [[ -n $rr5 ]] && r5=$rr5
+          [[ -n $ru7 ]] && u7=$ru7; [[ -n $rr7 ]] && r7=$rr7
+        fi
+        ro= ru5= rr5= ru7= rr7=
+        continue
+      fi
       k=${line%%[\"\']*} v=${line##*[\"\']}
       case $k in
-        *organization-id) o=$v ;;
-        *5h-utilization) u5=$v ;;
-        *5h-reset) r5=$v ;;
-        *7d-utilization) u7=$v ;;
-        *7d-reset) r7=$v ;;
+        *organization-id) ro=$v ;;
+        *5h-utilization) ru5=$v ;;
+        *5h-reset) rr5=$v ;;
+        *7d-utilization) ru7=$v ;;
+        *7d-reset) rr7=$v ;;
       esac
-    done < <(tail -c 131072 "$f" 2> /dev/null |
-             grep -oE "anthropic-(organization-id|ratelimit-unified-(5h|7d)-(utilization|reset))[\"']?: *[\"'][^\"']*")
+    done < <( { tail -c 131072 "$f" 2> /dev/null |
+                grep -oE "response start \{|anthropic-(organization-id|ratelimit-unified-(5h|7d)-(utilization|reset))[\"']?: *[\"'][^\"']*";
+                echo "response start {"; } )
     [[ $f == */sdk-* && $o != "$org" ]] && continue
     window five_hour "$u5" "$r5"
     window seven_day "$u7" "$r7"
-    (( ${#WIN[@]} )) && { TAKEN=1; return 0; }
+    (( ${#WIN[@]} )) && return 0
   done
   return 1
 }
@@ -121,7 +131,8 @@ describe() {  # DESC: "5h 6% (04:00), 7d 94% (Mon 09:00)", from WIN
 #                    heartbeat until its own wake-up arrives (the desktop app hands that over as a prompt, which then
 #                    is no real turn); when the last real turn ended: heartbeat k after it is due at since + k * beat,
 #                    while k <= idle
-#   gen wake         the waiting timer's process (0 none); when a paused session wakes (0 not paused)
+#   gen wake         the waiting timer's process (0 none, -pid after a user prompt); when a paused session wakes (0 not
+#                    paused)
 #   armed noticed    when it was armed; the notices given, ",five_hour@<reset>:<level>,...", and ",blind" once told
 #                    there is no reading
 
@@ -149,7 +160,7 @@ prune() {  # NOTICED forgets the windows that have reset
 
 # --- arm: /quotabeat [5-hour mark] [weekly mark] [5h=N] [week=N] [beat=minutes] [idle=count], N or off; or stop
 
-NO_READING="Claude Code's debug log has no rate-limit headers for this session (they need ANTHROPIC_LOG=debug and DEBUG=1, in the desktop app also DEBUG_CLAUDE_AGENT_SDK=1, set before Claude Code starts; claude -p prints them to stdout instead)"
+NO_READING="Claude Code's debug log has no rate-limit headers for this session (they need ANTHROPIC_LOG=debug and DEBUG_SDK=1, in the desktop app also DEBUG_CLAUDE_AGENT_SDK=1, set before Claude Code starts; claude -p prints them to stdout instead)"
 
 arm() {
   SID=${CLAUDE_CODE_SESSION_ID:-}
@@ -211,6 +222,9 @@ arm() {
   if read_usage; then
     describe
     usage="Usage now: $DESC."
+  elif [[ ${ANTHROPIC_LOG:-} == debug && -n ${DEBUG_SDK:-}${DEBUG:-} &&
+          ( -z ${CLAUDE_CODE_ORGANIZATION_UUID:-} || -n ${DEBUG_CLAUDE_AGENT_SDK:-} ) ]]; then
+    usage="No usage reading yet: waiting for this session's first response (claude -p prints headers to stdout instead)."
   else
     usage="No usage reading yet: $NO_READING, so nothing stops this session at a mark until they come."
   fi
@@ -254,11 +268,13 @@ post() {  # PostToolUse, in the background: the notice at a mark
 }
 
 stop() {  # Stop, in the background: the timer
-  [[ -r $DIR/$SID ]] || return 0
+  load_state || return 0
+  (( ACTIVE < 0 )) && { ACTIVE=0; save_state; }
   now
-  local t=$NOW h n r told=0 wake=0 next=0 need k names=  # t: the turn's last request read the cache just before
+  local t=$NOW s0="$M5:$M7:$BEAT:$IDLE:$SINCE:$GEN:$WAKE:$ARMED" h n r l told=0 wake=0 next=0 need k names=
   sleep 2  # the turn's last tool's PostToolUse lands first
   load_state || return 0
+  [[ "$M5:$M7:$BEAT:$IDLE:$SINCE:$GEN:$WAKE:$ARMED" == "$s0" ]] || { log "gave way"; return 0; }
   now
   (( ACTIVE > 0 )) && SINCE=$t  # a real turn ended: the heartbeats after a stop count from here
   ACTIVE=0
@@ -266,13 +282,17 @@ stop() {  # Stop, in the background: the timer
   over
   prune
   for h in "${HITS[@]}"; do
-    n=${h%%:*} r=${h#*:*:*:} r=${r%%:*}
+    n=${h%%:*} r=${h#*:*:*:} l=${r#*:} r=${r%%:*}
     [[ ,$NOTICED, == *",$n@"* ]] && told=1
     (( r > wake )) && wake=$r
     name "$n"
     names+="${names:+ and }$NAME"
   done
   if (( told )); then
+    for h in "${HITS[@]}"; do
+      n=${h%%:*} r=${h#*:*:*:} l=${r#*:} r=${r%%:*}
+      [[ ,$NOTICED, == *",$n@$r:$l,"* ]] || NOTICED+=,$n@$r:$l
+    done
     # Told to stop at a mark: wake a minute after the reset (the later one, with two windows at their marks). Bridging
     # the pause takes a heartbeat before each stretch without a cache read outgrows WARM; worth it only if they cost
     # less than writing the cache again when the session wakes cold. Then all of them, else none.
@@ -334,7 +354,7 @@ hook() {
     Stop) stop ;;
     UserPromptSubmit)  # in the desktop app a heartbeat's own wake-up comes this way too: that one is no real turn
       if load_state; then
-        if (( ACTIVE < 0 )); then ACTIVE=0; else ACTIVE=1 GEN=0; fi
+        if (( ACTIVE < 0 )); then ACTIVE=0; else ACTIVE=1 GEN=-$$; fi
         save_state
       fi ;;
     SessionEnd) rm -f "$DIR/$SID" ;;

@@ -18,7 +18,7 @@ setup() {
   [[ -n ${T:-} ]] && rm -rf "$T"
   T=$(mktemp -d)
   export CLAUDE_CONFIG_DIR=$T QUOTABEAT_UNIT=1
-  unset CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ORGANIZATION_UUID
+  unset CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ORGANIZATION_UUID ANTHROPIC_LOG DEBUG DEBUG_SDK DEBUG_CLAUDE_AGENT_SDK
   mkdir -p "$T/projects/p" "$T/debug"
   TR=$T/projects/p/s1.jsonl
   : > "$TR"
@@ -62,6 +62,7 @@ hm() { date -d "@$1" +%H:%M; }
 
 setup
 has "no debug log: no reading" "$(arm)" "No usage reading yet: Claude Code's debug log has no rate-limit headers for this session"
+has "env set, before the first response: says so without blaming the env" "$(ANTHROPIC_LOG=debug DEBUG_SDK=1 arm)" "No usage reading yet: waiting for this session's first response"
 cli_log 0.235 $((NOW + 3600)) 0.41 $((NOW + 3 * 86400))
 has "a terminal session's own log" "$(arm)" "Usage now: 5h 23% ($(hm $((NOW + 3600)))), 7d 41% ($(LC_ALL=C date -d @$((NOW + 3 * 86400)) '+%a %H:%M'))."
 cli_log 0.875 $((NOW + 3600)) 0.42 $((NOW + 3 * 86400))
@@ -77,6 +78,8 @@ has "the desktop app's log, its lines out of order" "$(arm)" "Usage now: 5h 35% 
 sleep 0.2
 desk_log sdk-b.txt org-x 0.9 $((NOW + 3600)) 0.9 $((NOW + 86400))
 has "a newer log of another organization doesn't count" "$(arm)" "Usage now: 5h 35% ("
+desk_log sdk-a.txt org-x 0.9 $((NOW + 3600)) 0.9 $((NOW + 86400))
+has "a response of another organization in the same desktop log doesn't count" "$(arm)" "Usage now: 5h 35% ("
 unset CLAUDE_CODE_ORGANIZATION_UUID
 has "without this session's organization the desktop logs aren't read" "$(arm)" "No usage reading yet"
 
@@ -211,6 +214,8 @@ for change in newer prompt off end; do
 done
 stop_bg; waiter; sleep 1.1; post
 wait $PID; is "a tool call alone leaves the timer be (the turn's own last PostToolUse may land late)" "$?" "2"
+stop_bg; sleep 0.4; prompt
+wait $PID; is "a prompt while Stop settles (before the timer starts) makes it give way and keeps the turn active" "$?:$(field 4)" "0:1"
 
 rm -rf "$T"
 echo "$PASS passed, $FAIL failed"

@@ -11,7 +11,7 @@
 3. **等待时心跳保温（原 cachebeat）。** 每 47 分钟一次心跳：钩子叫醒会话，Claude 只回一个 `.`。这次请求按缓存价读一遍上下文，1 小时的提示缓存就续上了。
    - **停在线上**（知道要等到几点）：心跳照样每 47 分钟一次。只有最后一段（最后一次心跳到叫醒；一次都不用跳时就是停下到叫醒）不超过 53 分钟就够了，因为叫醒时缓存还热（缓存的 1 小时留 7 分钟余量）。所以次数 = ⌈（到叫醒的分钟数 − 53）÷ 47⌉：等 50 分钟不跳，等 100 分钟跳 1 次，等 5 小时跳 6 次。少于 19 次就一路跳到重置，否则一次都不跳，醒来时冷读一次。账是这样算的：一次心跳读缓存，约 0.1 倍上下文的价；缓存冷了要重写，约 2 倍，比热读多 1.9 倍。所以不会出现「跳了一阵、最后还是冷掉」的双重花费。
    - **其他时候，只要停下**：再跳 7 次（`idle=N`），也就是停下后 7×47 分钟内。第 k 次在停下后 k×47 分钟，按时间算，不靠数 Claude 的回复。你发话或 Claude 用了工具，就从新的停下重新算。
-   - **电脑待机**：心跳只在缓存肯定还热时发出，也就是距上次读缓存不超过 53 分钟。睡过了就不跳，因为补跳只是付钱重写缓存。计时器每次最多睡 1 分钟就看一次时钟（Windows 的 `sleep` 是否把待机时间算进去没有核实），所以醒来后一分钟内就会按实际时间判断。
+   - **电脑待机**：心跳只在缓存肯定还热时发出，也就是距上次读缓存不超过 53 分钟。睡过了就不跳，因为补跳只是付钱重写缓存。Windows（Git Bash）和 macOS 的 `sleep` 在待机时不走表，所以计时器每次最多睡 1 分钟就看一次时钟，醒来后一分钟内就会按实际时间判断。
 
 ## 用量从哪里来（不联网，不多发请求）
 
@@ -33,10 +33,10 @@ quotabeat 在每次工具调用后和每一轮结束时读日志的尾部，每�
 2. 设三个用户环境变量。Windows（PowerShell）：
 
    ```powershell
-   'ANTHROPIC_LOG=debug','DEBUG=1','DEBUG_CLAUDE_AGENT_SDK=1' | % { $k,$v = $_ -split '='; [Environment]::SetEnvironmentVariable($k,$v,'User') }
+   'ANTHROPIC_LOG=debug','DEBUG_SDK=1','DEBUG_CLAUDE_AGENT_SDK=1' | % { $k,$v = $_ -split '='; [Environment]::SetEnvironmentVariable($k,$v,'User') }
    ```
 
-   macOS / Linux 写进 shell 的启动文件（`export ANTHROPIC_LOG=debug DEBUG=1 DEBUG_CLAUDE_AGENT_SDK=1`）。
+   macOS / Linux 写进 shell 的启动文件（`export ANTHROPIC_LOG=debug DEBUG_SDK=1 DEBUG_CLAUDE_AGENT_SDK=1`）。
 
 3. 桌面 App 完全退出再打开（连系统托盘图标一起退），终端开新窗口：已经在跑的程序拿不到新变量。
 
@@ -64,16 +64,14 @@ Claude 也可以自己启用（长时间无人值守的工作开始前）。启�
 
 ## 开着这三个变量的代价
 
-- `claude -p` 的输出前面会多一大段 SDK 的请求和响应记录（印在 stdout 上），读 `claude -p` 输出的脚本会受影响；这种会话也读不到用量。
-- debug 日志会一直变大。实测桌面的 `sdk-*.txt` 在连续工作时一分钟长了约 60 KB。要定期清理，例如删掉一天前的日志（正在用的日志一直在更新，不会被删）：
+- `claude -p` 的输出前面会多一大段 SDK 的请求和响应记录（印在 stdout 上），这种会话也读不到用量。读 `claude -p` 输出的脚本可以加 `-d2e`（`--debug-to-stderr`，把记录改印到 stderr），或临时设 `ANTHROPIC_LOG=warn claude -p ...`。
+- debug 日志会变大。Claude Code 默认只清 30 天前的 debug 日志（`cleanupPeriodDays`），期间单文件不按大小轮转；实测桌面的 `sdk-*.txt` 在连续工作时一分钟长了约 60 KB。可以定期删掉一天前的日志（正在用的日志一直在更新，不会被删）：
 
   ```bash
   find ~/.claude/debug -name '*.txt' -mtime +1 -delete
   ```
 
-  Claude Code 会不会自己清理这些日志，没有核实。
 - 桌面 App 里，这段记录是从 Claude Code 子进程的 stdout 出来的（那本来是传 JSON 的通道）；App 把非 JSON 的行记进日志后照常工作（桌面内置 Claude Code 2.1.309 实测）。
-- `DEBUG=1` 是个常见的名字，别的程序也可能因为它多输出东西（没有核实）。
 
 ## 怎么做的
 
