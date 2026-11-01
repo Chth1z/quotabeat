@@ -1,6 +1,6 @@
 # quotabeat
 
-一个 Claude Code skill：让一个会话里长时间、无人值守的工作守在套餐用量之内，等待时让提示缓存不失效。一个 bash 脚本加一份 SKILL.md，只用钩子，不联网，不用 Python。
+一个 Claude Code skill：让一个会话里长时间、无人值守的工作守在套餐用量之内，等待时让提示缓存不失效。一个 bash 脚本加一份 SKILL.md，只用钩子，不联网，不用 Python，读用量不多发任何请求。
 
 ## 它做什么
 
@@ -13,26 +13,34 @@
    - **其他时候，只要停下**：再跳 7 次（`idle=N`），也就是停下后 7×47 分钟内。第 k 次在停下后 k×47 分钟，按时间算，不靠数 Claude 的回复。你发话或 Claude 用了工具，就从新的停下重新算。
    - **电脑待机**：心跳只在缓存肯定还热时发出，也就是距上次读缓存不超过 53 分钟。睡过了就不跳，因为补跳只是付钱重写缓存。计时器每次最多睡 1 分钟就看一次时钟（Windows 的 `sleep` 是否把待机时间算进去没有核实），所以醒来后一分钟内就会按实际时间判断。
 
-## 用量从哪里来（不联网）
+## 用量从哪里来（不联网，不多发请求）
 
-- **终端里的会话**：Claude Code 每次回应都带着账号的用量（`rate_limits`），并交给状态栏命令。`quotabeat.sh statusline` 把它记在 `~/.claude/quotabeat/usage-<账号>`，每个账号一份（桌面 App 可以登录与终端不同的账号）。同一窗口里取较大的读数（闲着的会话拿旧数据重跑，压不低它），较新的窗口取代旧的。
-- **桌面 App 的会话**：桌面 App 不跑状态栏（实测）。钩子在需要时让 Claude 调一次 App 自带的用量工具 `get_usage`，自己读出数字记下来，并把那份约 600 token 的报告换成一行。多久查一次，看离线还有多远：还差 N 个百分点，就隔 N/2 分钟再查，最少 5 分钟、最多 1 小时。
+每个 API 响应的头里都带着账号的用量：`anthropic-ratelimit-unified-5h-utilization`（0.35 就是 35%）和 `-5h-reset`（重置时刻），一周的是 `7d`。设了下面三个环境变量，Claude Code 会把每个响应的头记进它的 debug 日志：
+
+- **终端里的会话**：`~/.claude/debug/<会话>.txt`，每个响应一行。
+- **桌面 App 的会话**：`~/.claude/debug/sdk-*.txt`，每个头一行，同一个响应的各行有时次序会乱。
+
+quotabeat 在每次工具调用后和每一轮结束时读日志的尾部，每个字段取最后出现的值，所以次序乱了也不要紧。终端会话只读自己的那份；桌面会话只认组织（org）和自己相同的日志（环境变量 `CLAUDE_CODE_ORGANIZATION_UUID`），所以终端和桌面登录不同账号也不会混在一起。读用量不调工具、不发请求，也不需要状态栏。
 
 ## 安装
 
-把 `SKILL.md` 和 `quotabeat.sh` 放进 `~/.claude/skills/quotabeat/`：
+1. 把 `SKILL.md` 和 `quotabeat.sh` 放进 `~/.claude/skills/quotabeat/`：
 
-```bash
-mkdir -p ~/.claude/skills/quotabeat && cp SKILL.md quotabeat.sh ~/.claude/skills/quotabeat/
-```
+   ```bash
+   mkdir -p ~/.claude/skills/quotabeat && cp SKILL.md quotabeat.sh ~/.claude/skills/quotabeat/
+   ```
 
-终端里的会话还要把状态栏交给 quotabeat，在 `~/.claude/settings.json` 里设：
+2. 设三个用户环境变量。Windows（PowerShell）：
 
-```json
-"statusLine": {"type": "command", "command": "bash ~/.claude/skills/quotabeat/quotabeat.sh statusline"}
-```
+   ```powershell
+   'ANTHROPIC_LOG=debug','DEBUG=1','DEBUG_CLAUDE_AGENT_SDK=1' | % { $k,$v = $_ -split '='; [Environment]::SetEnvironmentVariable($k,$v,'User') }
+   ```
 
-已有自己的状态栏：让它把收到的输入也交给这条命令一份即可。桌面 App 不需要这一步。需要 bash 和 coreutils（Windows 上是 Git Bash，Claude Code 本来就用它）。
+   macOS / Linux 写进 shell 的启动文件（`export ANTHROPIC_LOG=debug DEBUG=1 DEBUG_CLAUDE_AGENT_SDK=1`）。
+
+3. 桌面 App 完全退出再打开（连系统托盘图标一起退），终端开新窗口：已经在跑的程序拿不到新变量。
+
+需要 bash 和 coreutils（Windows 上是 Git Bash，Claude Code 本来就用它）。
 
 ## 使用
 
@@ -45,32 +53,43 @@ mkdir -p ~/.claude/skills/quotabeat && cp SKILL.md quotabeat.sh ~/.claude/skills
 /quotabeat stop         这个会话里关掉
 ```
 
-Claude 也可以自己启用（长时间无人值守的工作开始前）。启用后不用开任何东西：没有监视进程，用量随回应到达。状态栏显示 `5h 6% (04:00) | 7d 94% (Mon 09:00) | ctx 64% | guard 87/97`，停线等待时显示 `paused to 04:01`。
+Claude 也可以自己启用（长时间无人值守的工作开始前）。启用后不用开任何东西：没有监视进程，用量随响应写进日志。启用时回的一行里有当前用量；读不到时会直说原因。
 
 ## 额度花在哪里
 
-- 钩子都是本机进程，不发请求，不耗额度。
+- 钩子都是本机进程，不发请求，不耗额度；读用量也一样。
 - 启用时 SKILL.md 正文（约 400 token）进入上下文；描述（约 120 token）在每个会话的技能清单里。每条提醒几十 token。
 - 心跳：每次约读一次缓存的上下文（0.1 倍），加上一行提醒和一个 `.`。停在线上只在比冷缓存便宜时跳，其他时候每次停下后最多 7 次。
 - 叫醒：每次重置后一次请求。
-- 桌面 App：每次用量检查是一次工具调用，也就是多一次请求（读一次上下文）；离线越近越频繁，最密 5 分钟一次。这是目前最大的额外用量（属于取得用量的部分，暂未改动）。
+
+## 开着这三个变量的代价
+
+- `claude -p` 的输出前面会多一大段 SDK 的请求和响应记录（印在 stdout 上），读 `claude -p` 输出的脚本会受影响；这种会话也读不到用量。
+- debug 日志会一直变大。实测桌面的 `sdk-*.txt` 在连续工作时一分钟长了约 60 KB。要定期清理，例如删掉一天前的日志（正在用的日志一直在更新，不会被删）：
+
+  ```bash
+  find ~/.claude/debug -name '*.txt' -mtime +1 -delete
+  ```
+
+  Claude Code 会不会自己清理这些日志，没有核实。
+- 桌面 App 里，这段记录是从 Claude Code 子进程的 stdout 出来的（那本来是传 JSON 的通道）；App 把非 JSON 的行记进日志后照常工作（桌面内置 Claude Code 2.1.309 实测）。
+- `DEBUG=1` 是个常见的名字，别的程序也可能因为它多输出东西（没有核实）。
 
 ## 怎么做的
 
 | 钩子 | 时机 | 做什么 |
 | --- | --- | --- |
 | `!` 指令（SKILL.md） | 调用 `/quotabeat` 时 | `quotabeat.sh arm`：把这个会话的线和心跳写进 `~/.claude/quotabeat/<会话>`，回一行现状给 Claude |
-| PostToolUse（后台，asyncRewake） | 每次工具调用后 | 读本账号的用量，到线就以退出码 2 叫醒 Claude 并附上提醒；记下这一轮是真正的工作；桌面 App 里按需要求查一次用量 |
-| PostToolUse（`get_usage`） | 桌面 App 查用量后 | 记下用量，把报告换成一行 |
+| PostToolUse（后台，asyncRewake） | 每次工具调用后 | 从 debug 日志读用量，到线就以退出码 2 叫醒 Claude 并附上提醒；记下这一轮是真正的工作 |
 | Stop（后台，asyncRewake） | 每一轮结束时 | 计时器：被提醒停下的会话等到重置再叫醒，途中按上面的账心跳；其他时候在停下后跳 IDLE 次。更新的一轮结束、你发话、`stop`、会话结束，都会让等待中的计时器醒来时安静退出 |
 | UserPromptSubmit（后台） | 你发话时 | 等待中的计时器让位 |
 | SessionEnd | 会话结束 | 清掉状态 |
 
 ## 限制
 
-- 钩子跟着 Claude Code 进程注册：进程重启后要重新 `/quotabeat`。桌面 App 也会重启进程（例如设置或说明文件改动后，下一条消息到达时），重启后会话编号也会变。
+- 钩子跟着 Claude Code 进程注册：进程重启后要重新 `/quotabeat`。桌面 App 也会重启进程（例如设置或说明文件改动后，下一条消息到达时）。
 - 桌面 App 实测（2026-11-01）：闲置 5 分钟后，Stop 钩子的心跳把会话叫醒了；更长时间的闲置还没测过。桌面 App 会把叫醒当成一条 prompt 送进来（触发 UserPromptSubmit），计时器发心跳时先做记号，所以这条不算你发话。这个修正也在桌面 App 实测过：心跳那一轮之后起点没有移动，跳完设定的次数就停了。
-- `claude -p` 没有状态栏也没有 `get_usage`，看不到用量。
+- 只读 5 小时和一周两个窗口。
 - 一轮里直接用到 100%，那一轮以错误结束、不经过 Stop 钩子：所以要在线以下留备用。
 - 提示缓存只活 5 分钟的会话，心跳留不住它：启用时自动关掉心跳。
 
@@ -80,8 +99,8 @@ Claude 也可以自己启用（长时间无人值守的工作开始前）。启�
 bash tests/run.sh
 ```
 
-每个测试像 Claude Code 那样运行脚本（输入 JSON，读回退出码和输出），用自己的临时配置目录；`QUOTABEAT_UNIT=1` 把一分钟缩成一秒。排查问题时，建一个空文件 `~/.claude/quotabeat/debug`，钩子会把每次做了什么记到旁边的 `debug.log`。
+每个测试像 Claude Code 那样运行脚本（输入 JSON，读回退出码和输出），用自己的临时配置目录，按 Claude Code 的格式写 debug 日志；`QUOTABEAT_UNIT=1` 把一分钟缩成一秒。排查问题时，建一个空文件 `~/.claude/quotabeat/debug`，钩子会把每次做了什么记到旁边的 `debug.log`。
 
 ## 来历
 
-心跳的做法来自 [cachebeat](https://github.com/ARahim3/cachebeat)（MIT）；额度部分来自本机的额度监视脚本。被取代的版本在 `archive/`。
+心跳的做法来自 [cachebeat](https://github.com/ARahim3/cachebeat)（MIT）；从响应头日志读用量的办法来自用户的 `quota_headers.sh`。被取代的版本在 `archive/`。

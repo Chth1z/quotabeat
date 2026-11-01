@@ -13,12 +13,6 @@ hooks:
           timeout: 60
           rewakeMessage: "[quotabeat]"
           rewakeSummary: "quotabeat: usage mark"
-    - matcher: "mcp__ccd_session_mgmt__get_usage"
-      hooks:
-        - type: command
-          command: bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quotabeat/quotabeat.sh" usage
-          shell: bash
-          timeout: 10
   Stop:
     - hooks:
         - type: command
@@ -65,7 +59,8 @@ A reminder starting with `[quotabeat]` comes from the hooks: not from the user, 
   the cache, which is the whole point, and every token you add is read again by every later request. If a task of
   yours is mid-flight, carry on with it instead.
 - **"… has reset …"**: go on with the paused work.
-- **"Usage check due …"** (the desktop app): call the tool it names.
+- **"No usage reading …"**: tell the user in one line; quotabeat can't stop the session at a mark until the readings
+  come.
 
 ## Rules
 

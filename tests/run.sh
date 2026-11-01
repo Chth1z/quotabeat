@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # quotabeat's tests. Each runs quotabeat.sh as Claude Code does (JSON on stdin; exit code, stdout and stderr read
-# back) against a config folder of its own; QUOTABEAT_UNIT=1 makes a minute last one second.
+# back) against a config folder of its own, with debug logs written the way Claude Code writes them; QUOTABEAT_UNIT=1
+# makes a minute last one second.
 #
 #   bash tests/run.sh
 
@@ -17,18 +18,26 @@ setup() {
   [[ -n ${T:-} ]] && rm -rf "$T"
   T=$(mktemp -d)
   export CLAUDE_CONFIG_DIR=$T QUOTABEAT_UNIT=1
-  unset CLAUDE_CODE_ACCOUNT_UUID CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID
-  printf '{\n  "numStartups": 3,\n  "oauthAccount": {\n    "accountUuid": "acct-t",\n    "emailAddress": "x@y"\n  }\n}\n' > "$T/.claude.json"
-  mkdir -p "$T/projects/p"
+  unset CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ORGANIZATION_UUID
+  mkdir -p "$T/projects/p" "$T/debug"
   TR=$T/projects/p/s1.jsonl
   : > "$TR"
   NOW=$(date +%s)
 }
-sl() {  # sl <5h %> <5h reset> [<7d %> <7d reset>]: one status line run
-  local rl="\"five_hour\":{\"used_percentage\":$1,\"resets_at\":$2}"
-  [[ -n ${3:-} ]] && rl+=",\"seven_day\":{\"used_percentage\":$3,\"resets_at\":$4}"
-  printf '{"session_id":"s1","context_window":{"total_input_tokens":5,"current_usage":{"input_tokens":2},"used_percentage":12,"remaining_percentage":88},"rate_limits":{%s},"vim":{"mode":"NORMAL"}}\n' "$rl" |
-    bash "$QB" statusline
+cli_log() {  # cli_log <5h utilization> <5h reset> [<7d utilization> <7d reset>]: a response of terminal session s1, as
+             # its debug log keeps it: one line, \n escapes, single quotes
+  local n='\n' h="    'anthropic-ratelimit-unified-5h-reset': '$2',${n}    'anthropic-ratelimit-unified-5h-utilization': '$1',${n}"
+  [[ -n ${3:-} ]] && h+="    'anthropic-ratelimit-unified-7d-reset': '$4',${n}    'anthropic-ratelimit-unified-7d-utilization': '$3',${n}"
+  printf '%s\n' "2026-11-01T09:21:22.473Z [DEBUG] \"console.log: [log_1] response start {${n}  url: 'https://api.anthropic.com/v1/messages?beta=true',${n}  status: 200,${n}  headers: {${n}    'anthropic-organization-id': 'org-c',${n}${h}  },${n}  durationMs: 2244${n}}\"" >> "$T/debug/s1.txt"
+}
+desk_log() {  # desk_log <file> <org> <5h utilization> <5h reset> <7d utilization> <7d reset>: the desktop app's SDK log,
+              # a line per header, some out of order the way it writes them
+  local p='2026-11-01T09:29:05.324Z Non-JSON stdout:'
+  printf '%s\n' "$p [log_2] response start {" "$p   url: \"https://api.anthropic.com/v1/messages?beta=true\"," \
+    "$p     \"anthropic-organization-id\": \"$2\"," "$p   headers: {" \
+    "$p     \"anthropic-ratelimit-unified-5h-reset\": \"$4\"," "$p     \"anthropic-ratelimit-unified-5h-utilization\": \"$3\"," \
+    "$p   durationMs: 4962," "$p     \"anthropic-ratelimit-unified-7d-reset\": \"$6\"," \
+    "$p     \"anthropic-ratelimit-unified-7d-utilization\": \"$5\"," "$p   }," "$p }" >> "$T/debug/$1"
 }
 arm() { CLAUDE_CODE_SESSION_ID=s1 bash "$QB" arm "$@"; }
 input() { printf '{"session_id":"s1","transcript_path":"%s","cwd":"%s","hook_event_name":"%s"%s}' "$TR" "$T" "$1" "${2:-}"; }
@@ -38,7 +47,7 @@ post() {  # a tool ran: the async PostToolUse hook's stderr and exit code
 }
 prompt() { input UserPromptSubmit ',"prompt":"hi"' | bash "$QB" hook; }
 state() { cat "$T/quotabeat/s1"; }
-# 0 m5, 1 m7, 2 beat, 3 idle, 4 active, 5 since, 6 gen, 7 wake, 8 acct, 9 desk, 10 armed, 11 asked, 12 noticed
+# 0 m5, 1 m7, 2 beat, 3 idle, 4 active, 5 since, 6 gen, 7 wake, 8 armed, 9 noticed
 field() { local f; read -ra f < "$T/quotabeat/s1"; echo "${f[$1]}"; }
 set_field() { local f; read -ra f < "$T/quotabeat/s1"; f[$1]=$2; echo "${f[*]}" > "$T/quotabeat/s1"; }
 stop_bg() {  # the turn ends: its Stop hook runs in the background
@@ -47,37 +56,36 @@ stop_bg() {  # the turn ends: its Stop hook runs in the background
   PID=$!
 }
 waiter() { for _ in $(seq 1 80); do [[ $(field 6) == "$PID" ]] && return 0; sleep 0.1; done; return 1; }  # its timer waits
+hm() { date -d "@$1" +%H:%M; }
 
-# --- the status line and the readings
+# --- the usage, from Claude Code's debug log
 
 setup
-is "status line" "$(sl 23.5 $((NOW + 3600)) 41.2 $((NOW + 3 * 86400)))" "5h 23% ($(date -d @$((NOW + 3600)) +%H:%M)) | 7d 41% ($(LC_ALL=C date -d @$((NOW + 3 * 86400)) '+%a %H:%M')) | ctx 12%"
-read -r t w1 w2 < "$T/quotabeat/usage-acct-t"
-is "reading" "$w1 $w2" "five_hour:23.5:$((NOW + 3600)) seven_day:41.2:$((NOW + 3 * 86400))"
-sl 40 $((NOW + 3600)) > /dev/null
-sl 30 $((NOW + 3605)) > /dev/null
-has "within a window the larger stands" "$(cat "$T/quotabeat/usage-acct-t")" "five_hour:40:"
-has "a window missing from a response keeps its reading" "$(cat "$T/quotabeat/usage-acct-t")" "seven_day:41.2:"
-sl 5 $((NOW + 5 * 3600)) > /dev/null
-has "a later window replaces an earlier one" "$(cat "$T/quotabeat/usage-acct-t")" "five_hour:5:"
-sl 90 $((NOW + 3600)) > /dev/null
-has "an earlier window never comes back" "$(cat "$T/quotabeat/usage-acct-t")" "five_hour:5:"
-CLAUDE_CODE_ACCOUNT_UUID=acct-d sl 70 $((NOW + 3600)) > /dev/null
-has "each account has its own reading" "$(cat "$T/quotabeat/usage-acct-d")" "five_hour:70:"
-has "and leaves the others alone" "$(cat "$T/quotabeat/usage-acct-t")" "five_hour:5:"
+has "no debug log: no reading" "$(arm)" "No usage reading yet: Claude Code's debug log has no rate-limit headers for this session"
+cli_log 0.235 $((NOW + 3600)) 0.41 $((NOW + 3 * 86400))
+has "a terminal session's own log" "$(arm)" "Usage now: 5h 23% ($(hm $((NOW + 3600)))), 7d 41% ($(LC_ALL=C date -d @$((NOW + 3 * 86400)) '+%a %H:%M'))."
+cli_log 0.875 $((NOW + 3600)) 0.42 $((NOW + 3 * 86400))
+has "the newest response counts; the percent is rounded down" "$(arm)" "Usage now: 5h 87% ("
+cli_log 1 $((NOW + 3600))
+has "a window a response doesn't name keeps its last value" "$(arm)" "5h 100% ($(hm $((NOW + 3600)))), 7d 42% ("
+printf '%s\n' "'anthropic-ratelimit-unified-5h-utilization': '0.5', 'anthropic-ratelimit-unified-5h-reset': '$((NOW + 3600))'" > "$T/debug/s2.txt"
+has "another terminal session's log is not this one's" "$(arm)" "5h 100% ("
 setup
-sl 50 $((NOW + 3600)) 41 $((NOW + 86400)) > /dev/null
-is "a window Claude Code no longer sends keeps its place" "$(sl 9 $((NOW - 10)) | cut -d'|' -f1)" "5h 50% ($(date -d @$((NOW + 3600)) +%H:%M)) "
-setup
-is "a reset window reads 0" "$(sl 9 $((NOW - 10)) | cut -d'|' -f1)" "5h 0% "
+export CLAUDE_CODE_ORGANIZATION_UUID=org-d
+desk_log sdk-a.txt org-d 0.35 $((NOW + 3600)) 0.3 $((NOW + 86400))
+has "the desktop app's log, its lines out of order" "$(arm)" "Usage now: 5h 35% ($(hm $((NOW + 3600)))), 7d 30% ($(LC_ALL=C date -d @$((NOW + 86400)) '+%a %H:%M'))."
+sleep 0.2
+desk_log sdk-b.txt org-x 0.9 $((NOW + 3600)) 0.9 $((NOW + 86400))
+has "a newer log of another organization doesn't count" "$(arm)" "Usage now: 5h 35% ("
+unset CLAUDE_CODE_ORGANIZATION_UUID
+has "without this session's organization the desktop logs aren't read" "$(arm)" "No usage reading yet"
 
 # --- arming
 
 setup
-sl 6 $((NOW + 3600)) 94 $((NOW + 86400)) > /dev/null
+cli_log 0.06 $((NOW + 3600)) 0.94 $((NOW + 86400))
 has "arm: defaults" "$(arm)" "quotabeat on: stop at 87% of the 5-hour window and 97% of the weekly; a heartbeat every 47 minutes while the session waits: 7 after a stop, all the way through a quota pause when that costs less than a cold cache. Usage now: 5h 6%"
-is "arm: state" "$(state)" "87 97 47 7 1 0 0 0 acct-t 0 $(field 10) 0 -"
-has "arm: the status line shows the marks" "$(sl 6 $((NOW + 3600)))" "| guard 87/97"
+is "arm: state" "$(state)" "87 97 47 7 1 0 0 0 $(field 8) -"
 arm 80 90 > /dev/null; is "arm: two numbers" "$(field 0) $(field 1)" "80 90"
 arm 85% > /dev/null; is "arm: one number, a percent sign" "$(field 0) $(field 1)" "85 97"
 arm week=off Beat=30 IDLE=3 > /dev/null; is "arm: key=value, any case" "$(field 0) $(field 1) $(field 2) $(field 3)" "87 0 30 3"
@@ -97,53 +105,34 @@ is "arm: 5-minute cache state" "$(field 2)" "0"
 # --- the mark notice (PostToolUse)
 
 setup
-sl 50 $((NOW + 3600)) 50 $((NOW + 86400)) > /dev/null
+cli_log 0.5 $((NOW + 3600)) 0.5 $((NOW + 86400))
 arm > /dev/null
 post; is "below the marks: nothing" "$CODE:$OUT" "0:"
 set_field 4 0; post; is "a tool marks a real turn" "$(field 4)" "1"
-sl 88 $((NOW + 3600)) > /dev/null
+cli_log 0.869 $((NOW + 3600)) 0.5 $((NOW + 86400))
+post; is "86.9% is not yet at an 87% mark" "$CODE:$OUT" "0:"
+cli_log 0.88 $((NOW + 3600)) 0.5 $((NOW + 86400))
 post; is "at the 5-hour mark: exit 2" "$CODE" "2"
-has "at the 5-hour mark: the notice" "$OUT" "The 5-hour usage is 88%, at its 87% mark"
-has "at the 5-hour mark: what to do" "$OUT" "and end the turn without waiting yourself: the session wakes by itself at $(date -d @$((NOW + 3601)) +%H:%M), after the reset."
+has "at the 5-hour mark: the notice" "$OUT" "The 5-hour usage is 88%, at its 87% mark."
+has "at the 5-hour mark: what to do" "$OUT" "and end the turn without waiting yourself: the session wakes by itself at $(hm $((NOW + 3601))), after the reset."
 post; is "the notice comes once" "$CODE:$OUT" "0:"
-sl 94 $((NOW + 3600)) > /dev/null
+cli_log 0.94 $((NOW + 3600)) 0.5 $((NOW + 86400))
 post; has "past the middle of the reserve: again, firmer" "$OUT" "well past its 87% mark: end the turn now"
-sl 97 $((NOW + 3600)) 97 $((NOW + 86400)) > /dev/null
+cli_log 0.97 $((NOW + 3600)) 0.97 $((NOW + 86400))
 post; has "the weekly mark" "$OUT" "The weekly usage is 97%, at its 97% mark"
-OUT=$(input PostToolUse ',"tool_name":"mcp__ccd_session_mgmt__get_usage","tool_response":{}' | bash "$QB" hook 2>&1)
-is "the usage tool's call is left to its own hook" "$?:$OUT" "0:"
-arm stop > /dev/null; sl 99 $((NOW + 3600)) > /dev/null
+arm stop > /dev/null; cli_log 0.99 $((NOW + 3600))
 post; is "disarmed: nothing" "$CODE:$OUT" "0:"
 setup
 arm > /dev/null
 post; is "no reading, just armed: nothing yet" "$CODE:$OUT" "0:"
 sleep 2.2
-post; has "no reading after two minutes: said once" "$OUT" "the statusLine isn't quotabeat's"
+post; has "no reading after two minutes: said once" "$OUT" "No usage reading: Claude Code's debug log has no rate-limit headers"
 post; is "and only once" "$CODE:$OUT" "0:"
-
-# --- the desktop app: get_usage
-
-setup
-export CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_ACCOUNT_UUID=acct-d
-has "desktop arm without a reading" "$(arm)" "call mcp__ccd_session_mgmt__get_usage once now"
-is "desktop arm: that request counts as asked" "$(field 11)" "$(field 10)"
-set_field 11 0
-post; has "desktop: a usage check is asked for" "$OUT" "Usage check due: call mcp__ccd_session_mgmt__get_usage"
-post; is "desktop: asked once until it is due again" "$CODE:$OUT" "0:"
-REPORT='{\n  \"plan\": {\n    \"status\": \"ok\",\n    \"windows\": [\n      {\n        \"label\": \"5-hour limit\",\n        \"percentUsed\": 16,\n        \"resetsAt\": \"2030-01-01T04:19:59.929Z\",\n        \"resetsIn\": \"4h\"\n      },\n      {\n        \"label\": \"Weekly · all models\",\n        \"percentUsed\": 2,\n        \"resetsAt\": \"2030-01-02T06:59:59.929Z\"\n      }\n    ]\n  }\n}'
-USAGE_IN=$(input PostToolUse ",\"tool_name\":\"mcp__ccd_session_mgmt__get_usage\",\"tool_input\":{},\"tool_response\":[{\"type\":\"text\",\"text\":\"$REPORT\"}]")
-OUT=$(printf '%s' "$USAGE_IN" | bash "$QB" usage)
-is "desktop: the report is recorded" "$(cut -d' ' -f2- "$T/quotabeat/usage-acct-d")" "five_hour:16:1893471599 seven_day:2:1893567599"
-has "desktop: and handed back in one line" "$OUT" '"updatedToolOutput":"Usage (recorded by quotabeat): 5h 16% ('
-arm > /dev/null
-OUT=$(printf '%s' "$USAGE_IN" | bash "$QB" usage)
-is "desktop: a call quotabeat didn't ask for keeps its whole report" "$OUT" ""
-unset CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_ACCOUNT_UUID
 
 # --- Stop: heartbeats after a stop, counted by the time since it
 
 setup
-sl 10 $((NOW + 3600)) > /dev/null
+cli_log 0.1 $((NOW + 3600))
 arm beat=3 idle=2 > /dev/null
 stop_bg; wait $PID; CODE=$?
 is "after a stop: a heartbeat one interval later" "$CODE:$(cat "$T/stop.err")" "2:$BEAT_NOTE"
@@ -171,7 +160,7 @@ is "the machine slept past the time the cache is surely warm: no heartbeat" "$CO
 # --- Stop: a pause at a mark
 
 setup
-sl 88 $((NOW + 8)) > /dev/null
+cli_log 0.88 $((NOW + 8))
 arm beat=1 > /dev/null
 post
 stop_bg; wait $PID; CODE=$?
@@ -179,16 +168,15 @@ is "told to stop at a mark: wakes after the reset, no heartbeat while the cache 
 is "after the wake-up nothing is pending, and that turn is a real one" "$(field 7):$(field 4)" "0:1"
 
 setup
-sl 88 $((NOW + 65)) > /dev/null
+cli_log 0.88 $((NOW + 65))
 arm beat=1 > /dev/null
 post
 stop_bg; wait $PID; CODE=$?
 is "a pause the cache can't outlast, cheap enough to bridge: heartbeats" "$CODE:$(cat "$T/stop.err")" "2:$BEAT_NOTE"
 is "and the session stays paused" "$(field 7)" "$((NOW + 66))"
-has "the status line says so" "$(sl 88 $((NOW + 65)))" "| paused to $(date -d @$((NOW + 66)) +%H:%M)"
 
 setup
-sl 88 $((NOW + 200)) > /dev/null
+cli_log 0.88 $((NOW + 200))
 arm beat=5 > /dev/null
 post
 stop_bg; waiter
@@ -197,7 +185,7 @@ sleep 7; kill -0 $PID 2> /dev/null; is "and sends no heartbeat at all" "$?:$(cat
 kill $PID 2> /dev/null; wait $PID 2> /dev/null
 
 setup
-sl 88 $((NOW + 3600)) > /dev/null
+cli_log 0.88 $((NOW + 3600))
 arm beat=1 > /dev/null
 stop_bg; wait $PID; CODE=$?
 is "at a mark but never told (an idle session): heartbeats as after any stop, no wake-up" "$CODE:$(cat "$T/stop.err"):$(field 7)" "2:$BEAT_NOTE:0"
@@ -205,7 +193,7 @@ is "at a mark but never told (an idle session): heartbeats as after any stop, no
 # --- a waiting timer gives way
 
 setup
-sl 10 $((NOW + 3600)) > /dev/null
+cli_log 0.1 $((NOW + 3600))
 arm beat=4 > /dev/null  # (long enough for a newer Stop to settle and take over before this one's heartbeat)
 for change in newer prompt off end; do
   stop_bg; waiter || is "$change: the timer waits" no yes
