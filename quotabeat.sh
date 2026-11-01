@@ -125,6 +125,23 @@ describe() {  # DESC: "5h 6% (04:00), 7d 94% (Mon 09:00)", from WIN
   done
 }
 
+context_tokens() {  # CTX: this session's context size ("511k tokens") from its last response's usage in the transcript
+  CTX=
+  local f u i=0 c=0 r=0 total
+  for f in "$CFG"/projects/*/"$SID".jsonl; do
+    [[ -r $f ]] || continue
+    u=$(tail -c 400000 "$f" | grep -oE '"usage":\{[^}]*' | tail -n 1)
+    [[ $u =~ \"input_tokens\":([0-9]+) ]] && i=${BASH_REMATCH[1]}
+    [[ $u =~ \"cache_creation_input_tokens\":([0-9]+) ]] && c=${BASH_REMATCH[1]}
+    [[ $u =~ \"cache_read_input_tokens\":([0-9]+) ]] && r=${BASH_REMATCH[1]}
+    total=$(( i + c + r ))
+    (( total > 0 )) || continue
+    if (( total >= 1000 )); then CTX="$(( (total + 500) / 1000 ))k tokens"; else CTX="$total tokens"; fi
+    return 0
+  done
+  return 1
+}
+
 # --- a session's state, one line: m5 m7 beat idle active since gen wake armed noticed. No file: not armed.
 #   m5 m7 beat idle  the marks (percent, 0 off), minutes between heartbeats (0 off), heartbeats after a stop
 #   active since     1 once a real turn ran (a prompt, a tool call, arming, a wake-up) since the last Stop, -1 from a
@@ -259,6 +276,13 @@ post() {  # PostToolUse, in the background: the notice at a mark
   if (( until )); then
     clock $(( until + U ))
     msg+=" Finish or checkpoint the step at hand, note what comes next, and end the turn without waiting yourself: the session wakes by itself at $CLOCK, after the reset."
+    if (( BEAT )); then
+      local need=$(( (until + U - NOW - WARM + BEAT * U - 1) / (BEAT * U) ))
+      if (( need * CACHE_READ >= CACHE_WRITE - CACHE_READ )); then
+        context_tokens
+        msg+=" No heartbeats will run during this wait ($need beats would cost more than a cold cache); briefly tell the user${CTX:+ that the context is at ~$CTX} and ask whether they want to /compact."
+      fi
+    fi
   fi
   (( changed )) && { prune; save_state; }
   [[ -n $msg ]] || return 0

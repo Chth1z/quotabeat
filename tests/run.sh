@@ -114,15 +114,19 @@ post; is "below the marks: nothing" "$CODE:$OUT" "0:"
 set_field 4 0; post; is "a tool marks a real turn" "$(field 4)" "1"
 cli_log 0.869 $((NOW + 3600)) 0.5 $((NOW + 86400))
 post; is "86.9% is not yet at an 87% mark" "$CODE:$OUT" "0:"
-cli_log 0.88 $((NOW + 3600)) 0.5 $((NOW + 86400))
+cli_log 0.88 $((NOW + 300)) 0.5 $((NOW + 86400))
 post; is "at the 5-hour mark: exit 2" "$CODE" "2"
 has "at the 5-hour mark: the notice" "$OUT" "The 5-hour usage is 88%, at its 87% mark."
-has "at the 5-hour mark: what to do" "$OUT" "and end the turn without waiting yourself: the session wakes by itself at $(hm $((NOW + 3601))), after the reset."
+has "at the 5-hour mark: what to do" "$OUT" "and end the turn without waiting yourself: the session wakes by itself at $(hm $((NOW + 301))), after the reset."
+[[ $OUT == *"No heartbeats"* ]]; is "a pause cheap enough to bridge doesn't warn that heartbeats are skipped" "$?" "1"
 post; is "the notice comes once" "$CODE:$OUT" "0:"
-cli_log 0.94 $((NOW + 3600)) 0.5 $((NOW + 86400))
+cli_log 0.94 $((NOW + 300)) 0.5 $((NOW + 86400))
 post; has "past the middle of the reserve: again, firmer" "$OUT" "well past its 87% mark: end the turn now"
-cli_log 0.97 $((NOW + 3600)) 0.97 $((NOW + 86400))
+printf '{"type":"assistant","message":{"usage":{"input_tokens":3,"cache_creation_input_tokens":780,"cache_read_input_tokens":510000,"output_tokens":90}}}\n' > "$TR"
+cli_log 0.97 $((NOW + 300)) 0.97 $((NOW + 86400))
 post; has "the weekly mark" "$OUT" "The weekly usage is 97%, at its 97% mark"
+has "when heartbeats through the pause would cost more than a cold cache: tells the user context size and asks about /compact" "$OUT" "No heartbeats will run during this wait ("
+has "includes the rounded context token size from the transcript" "$OUT" "that the context is at ~511k tokens and ask whether they want to /compact."
 arm stop > /dev/null; cli_log 0.99 $((NOW + 3600))
 post; is "disarmed: nothing" "$CODE:$OUT" "0:"
 setup

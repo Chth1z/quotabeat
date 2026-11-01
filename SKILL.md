@@ -54,7 +54,9 @@ A reminder starting with `[quotabeat]` comes from the hooks: not from the user, 
 
 - **"… at its 87% mark …"**: finish or checkpoint the step at hand, note what comes next where the next turn will find
   it, and end the turn. Don't wait, sleep or poll yourself: the session wakes after the reset. The usage above the mark
-  is the reserve, for the wrap-up, heartbeats and emergencies.
+  is the reserve, for the wrap-up, heartbeats and emergencies. If the notice says no heartbeats will run during this
+  wait, briefly tell the user that heartbeating isn't worth the cost over so long a wait, state the current context
+  size if given, and ask whether they want to `/compact`.
 - **"heartbeat …"**: reply with exactly `.` and nothing else, no tools. The wake-up itself read the conversation from
   the cache, which is the whole point, and every token you add is read again by every later request. If a task of
   yours is mid-flight, carry on with it instead.
